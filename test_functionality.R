@@ -1,0 +1,10 @@
+print("Loading libraries...")
+
+library(tidyverse)
+
+rm(list = ls())
+
+mpg
+
+ggplot(data = mpg) + 
+    geom_point(mapping = aes(x = displ, y = hwy))
