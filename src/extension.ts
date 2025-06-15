@@ -485,77 +485,158 @@ async function sendToJupyter(mode: 'selection' | 'file') {
  * @returns A range covering the entire code block
  */
 function detectCodeBlock(document: vscode.TextDocument, currentLine: number): vscode.Range {
-    // Get the current line text
-    const currentLineText = document.lineAt(currentLine).text;
-    
-    // Check if this line has pipe indicators
-    const hasPipe = currentLineText.includes('%>%') || 
-                    currentLineText.includes('|>') || 
-                    currentLineText.includes('+');
-                    
-    const isPipeContinuation = currentLineText.trim().startsWith('%>%') || 
-                               currentLineText.trim().startsWith('|>') || 
-                               currentLineText.trim().startsWith('+');
-                               
-    // Check if we're in a pipe chain
-    const isInPipeChain = hasPipe || isPipeContinuation || 
-                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('%>%')) ||
-                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('|>')) ||
-                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('+'));
-    
-    // If not in a pipe chain, just return the current line
-    if (!isInPipeChain) {
+    // Simple check if the line is empty or a comment
+    const currentLineText = document.lineAt(currentLine).text.trim();
+    if (currentLineText === '' || currentLineText.startsWith('#')) {
         return document.lineAt(currentLine).range;
     }
     
-    // We're in a pipe chain, find its boundaries
+    // Detect if we're in a pipe chain or code block
+    return detectPipeOrBlockRange(document, currentLine);
+}
+
+/**
+ * Detects the range of a pipe chain or code block
+ */
+function detectPipeOrBlockRange(document: vscode.TextDocument, currentLine: number): vscode.Range {
+    /**
+     * Checks if a line contains dplyr pipe operators
+     */
+    const hasDplyrPipe = (line: string): boolean => {
+        return line.includes('%>%') || line.includes('|>');
+    };
+    
+    /**
+     * Checks if a line ends with dplyr pipe operators
+     */
+    const endsDplyrPipe = (line: string): boolean => {
+        return line.trim().endsWith('%>%') || line.trim().endsWith('|>');
+    };
+    
+    /**
+     * Checks if a line starts with dplyr pipe operators
+     */
+    const startsDplyrPipe = (line: string): boolean => {
+        return line.trim().startsWith('%>%') || line.trim().startsWith('|>');
+    };
+    
+    /**
+     * Checks if a line contains ggplot plus operator
+     */
+    const hasPlus = (line: string): boolean => {
+        return line.includes('+');
+    };
+    
+    /**
+     * Checks if a line ends with plus
+     */
+    const endsPlus = (line: string): boolean => {
+        return line.trim().endsWith('+');
+    };
+    
+    /**
+     * Checks if a line starts with plus
+     */
+    const startsPlus = (line: string): boolean => {
+        return line.trim().startsWith('+');
+    };
+    
+    /**
+     * Checks if a line is part of a ggplot expression
+     */
+    const isGgplotRelated = (line: string): boolean => {
+        return line.includes('ggplot(') || 
+               line.includes('geom_') ||
+               line.includes('scale_') || 
+               line.includes('theme_') ||
+               line.includes('labs(') ||
+               line.includes('coord_') ||
+               line.includes('facet_');
+    };
+    
+    // Get the current line text and adjacent lines
+    const currentLineText = document.lineAt(currentLine).text;
+    const prevLine = currentLine > 0 ? document.lineAt(currentLine - 1).text : '';
+    const nextLine = currentLine < document.lineCount - 1 ? document.lineAt(currentLine + 1).text : '';
+    
+    // Check if we're in a pipe or ggplot chain
+    const isInDplyrPipe = hasDplyrPipe(currentLineText) || 
+                           endsDplyrPipe(prevLine) ||
+                           startsDplyrPipe(currentLineText) ||
+                           startsDplyrPipe(nextLine);
+                           
+   
+    const isInGgplot = isGgplotRelated(currentLineText) ||
+                       hasPlus(currentLineText) ||
+                       endsPlus(prevLine) ||
+                       startsPlus(currentLineText) ||
+                       startsPlus(nextLine);
+    
+    // If not in any chain, just return the current line
+    if (!isInDplyrPipe && !isInGgplot) {
+        return document.lineAt(currentLine).range;
+    }
+    
+    // --- Find the start of the code block ---
     let startLine = currentLine;
+    
+    // Look backward to find the start of the chain
+    for (let i = currentLine; i >= 0; i--) {
+        const line = document.lineAt(i).text.trim();
+        
+        // Skip empty lines and comments
+        if (line === '' || line.startsWith('#')) {
+            continue;
+        }
+        
+        // Check for data source or assignment that could be the start
+        if ((line.includes('<-') || line.includes('=')) && 
+            !endsDplyrPipe(line) && !endsPlus(line)) {
+            startLine = i;
+            break;
+        }
+        
+        // Check for data frame references that could be the start
+        if (i > 0) {
+            const prevToLine = document.lineAt(i-1).text.trim();
+            // If current line doesn't continue and previous doesn't end with continuation
+            if (!startsDplyrPipe(line) && !startsPlus(line) &&
+                !endsDplyrPipe(prevToLine) && !endsPlus(prevToLine)) {
+                // This could be a start (data reference, etc.)
+                startLine = i;
+                break;
+            }
+        }
+        
+        // Keep tracking back
+        startLine = i;
+    }
+    
+    // --- Find the end of the code block ---
     let endLine = currentLine;
     
-    // Find the start by going backward
-    for (let i = currentLine - 1; i >= 0; i--) {
-        const lineText = document.lineAt(i).text.trim();
+    // Look forward to find the end of the chain
+    for (let i = currentLine; i < document.lineCount; i++) {
+        const line = document.lineAt(i).text.trim();
         
         // Skip empty lines and comments
-        if (lineText === '' || lineText.startsWith('#')) {
+        if (line === '' || line.startsWith('#')) {
             continue;
         }
         
-        // If this line ends with a pipe operator
-        if (lineText.endsWith('%>%') || lineText.endsWith('|>') || lineText.endsWith('+')) {
-            startLine = i;
-            continue;
-        }
+        // Update the current end line as we go
+        endLine = i;
         
-        // We've reached a line that doesn't end with a pipe operator
-        // Check if it might be the start of the pipe chain
-        if (lineText.includes('<-') || lineText.includes('=')) {
-            startLine = i;
-        } else {
-            startLine = i + 1;
+        // If this line doesn't end with pipe/plus and next line doesn't continue
+        if (!endsDplyrPipe(line) && !endsPlus(line) && 
+            (i === document.lineCount - 1 || 
+             (!startsDplyrPipe(document.lineAt(i+1).text) && 
+              !startsPlus(document.lineAt(i+1).text)))) {
+            break;
         }
-        break;
     }
     
-    // Find the end by going forward
-    for (let i = currentLine + 1; i < document.lineCount; i++) {
-        const lineText = document.lineAt(i).text.trim();
-        
-        // Skip empty lines and comments
-        if (lineText === '' || lineText.startsWith('#')) {
-            continue;
-        }
-        
-        // If this line starts with a pipe continuation
-        if (lineText.startsWith('%>%') || lineText.startsWith('|>') || lineText.startsWith('+')) {
-            endLine = i;
-            continue;
-        }
-        
-        // We've reached a line that doesn't continue the pipe
-        break;
-    }
-    
+    // Return the range spanning the entire chain
     return new vscode.Range(
         new vscode.Position(startLine, 0),
         document.lineAt(endLine).range.end
