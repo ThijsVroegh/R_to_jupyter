@@ -1,5 +1,16 @@
 import * as vscode from 'vscode';
 
+const console = {
+    log: function(...args: any[]) {
+        // Forward to VS Code's console
+        vscode.window.showInformationMessage(args.join(' '));
+    },
+    error: function(...args: any[]) {
+        // Forward to VS Code's console
+        vscode.window.showErrorMessage(args.join(' '));
+    }
+};
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('R Send to Jupyter extension is now active');
 
@@ -39,10 +50,26 @@ async function sendToJupyter(mode: 'selection' | 'file') {
         let codeToSend: string;
         if (mode === 'selection') {
             const selection = editor.selection;
-            codeToSend = editor.document.getText(selection);
+            
+            if (selection.isEmpty) {
+                // No text selected, just use the current line
+                const lineNumber = selection.active.line;
+                const currentLine = editor.document.lineAt(lineNumber);
+                
+                // Select the whole line for visual feedback
+                editor.selection = new vscode.Selection(
+                    currentLine.range.start,
+                    currentLine.range.end
+                );
+                
+                codeToSend = currentLine.text;
+            } else {
+                // Text is selected, use the selection
+                codeToSend = editor.document.getText(selection);
+            }
 
-            if (!codeToSend) {
-                vscode.window.showWarningMessage("No code selected");
+            if (!codeToSend || codeToSend.trim() === '') {
+                vscode.window.showWarningMessage("No code selected or line is empty");
                 return;
             }
         } else {
@@ -240,7 +267,8 @@ async function sendToJupyter(mode: 'selection' | 'file') {
                 // Skip the warning dialog and proceed directly
                 // Instead of showing a warning, just log a message
                 if (!kernels || !hasRKernel) {
-                    console.log('Could not verify R kernel availability. Continuing anyway.');
+                    // Warning message removed
+                    // console.log('Could not verify R kernel availability. Continuing anyway.');
                     // We'll still show information about IRkernel in the status bar
                     vscode.window.setStatusBarMessage(
                         'Please ensure IRkernel is installed if you encounter issues',
@@ -437,6 +465,132 @@ async function sendToJupyter(mode: 'selection' | 'file') {
         console.error(`Error in rSendToJupyter.send${mode === 'selection' ? 'Selection' : 'File'}:`, error);
         vscode.window.showErrorMessage(`Error sending code to Jupyter: ${error}`);
     }
+}
+
+/**
+ * Find the start line of a code block
+ * @param document The text document
+ * @param currentLine The line to start from
+ * @returns The line number where the block starts
+ */
+function findStartOfBlock(document: vscode.TextDocument, currentLine: number): number {
+    let startLine = currentLine;
+    let openBraces = 0;
+    let openParens = 0;
+    let inPipe = false;
+    
+    // Check the current line first
+    const currentText = document.lineAt(currentLine).text;
+    openBraces += (currentText.match(/{/g) || []).length;
+    openBraces -= (currentText.match(/}/g) || []).length;
+    openParens += (currentText.match(/\(/g) || []).length;
+    openParens -= (currentText.match(/\)/g) || []).length;
+    inPipe = currentText.includes('%>%') || currentText.includes('|>') || 
+             currentText.includes('+') && currentText.trim().startsWith('+');
+    
+    // Go up until we find the start of the block
+    for (let i = currentLine - 1; i >= 0; i--) {
+        const line = document.lineAt(i).text.trim();
+        
+        // Skip empty lines and comments
+        if (line === '' || line.startsWith('#')) {
+            continue;
+        }
+        
+        // Check for block structures
+        openBraces += (line.match(/{/g) || []).length;
+        openBraces -= (line.match(/}/g) || []).length;
+        openParens += (line.match(/\(/g) || []).length;
+        openParens -= (line.match(/\)/g) || []).length;
+        
+        // Check for pipes and ggplot continuation
+        const hasPipe = line.includes('%>%') || line.includes('|>');
+        const isGgplotContinuation = line.includes('+') && !line.trim().startsWith('+');
+        
+        // If we're in a pipe chain, continue until we find a line that doesn't end with a pipe
+        if (inPipe) {
+            if (!hasPipe && !line.endsWith('+')) {
+                inPipe = false;
+                startLine = i;
+                break;
+            }
+            startLine = i;
+        }
+        // If we find a line with a pipe at the end, we're starting a pipe chain
+        else if (hasPipe || isGgplotContinuation) {
+            inPipe = true;
+            startLine = i;
+        }
+        // If we've found balanced braces and parentheses, and we're not in a pipe chain
+        else if (openBraces <= 0 && openParens <= 0 && !inPipe) {
+            startLine = i;
+            break;
+        }
+    }
+    
+    return startLine;
+}
+
+/**
+ * Find the end line of a code block
+ * @param document The text document
+ * @param currentLine The line to start from
+ * @returns The line number where the block ends
+ */
+function findEndOfBlock(document: vscode.TextDocument, currentLine: number): number {
+    let endLine = currentLine;
+    let openBraces = 0;
+    let openParens = 0;
+    let inPipe = false;
+    
+    // Check the current line first
+    const currentText = document.lineAt(currentLine).text;
+    openBraces += (currentText.match(/{/g) || []).length;
+    openBraces -= (currentText.match(/}/g) || []).length;
+    openParens += (currentText.match(/\(/g) || []).length;
+    openParens -= (currentText.match(/\)/g) || []).length;
+    inPipe = currentText.includes('%>%') || currentText.includes('|>') || 
+             currentText.trim().endsWith('+');
+    
+    // Go down until we find the end of the block
+    for (let i = currentLine + 1; i < document.lineCount; i++) {
+        const line = document.lineAt(i).text.trim();
+        
+        // Skip empty lines and comments
+        if (line === '' || line.startsWith('#')) {
+            continue;
+        }
+        
+        // Check for block structures
+        openBraces += (line.match(/{/g) || []).length;
+        openBraces -= (line.match(/}/g) || []).length;
+        openParens += (line.match(/\(/g) || []).length;
+        openParens -= (line.match(/\)/g) || []).length;
+        
+        // Check for pipes and ggplot continuation
+        const startsWithPlus = line.trim().startsWith('+');
+        const hasPipe = line.includes('%>%') || line.includes('|>');
+        
+        // If we're in a pipe chain, continue until we find a line that doesn't have a pipe
+        if (inPipe) {
+            if (!hasPipe && !startsWithPlus) {
+                inPipe = false;
+            }
+            endLine = i;
+        }
+        // If we find a line with a pipe or starting with +, we're continuing a chain
+        else if (hasPipe || startsWithPlus) {
+            inPipe = true;
+            endLine = i;
+        }
+        // If we've found balanced braces and parentheses, and we're not in a pipe chain
+        else if (openBraces <= 0 && openParens <= 0 && !inPipe) {
+            endLine = i;
+            break;
+        }
+    }
+    
+    return endLine;
 }
 
 export function deactivate() {}

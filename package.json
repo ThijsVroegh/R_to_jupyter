@@ -37,22 +37,12 @@
       {
         "command": "rSendToJupyter.sendSelection",
         "key": "ctrl+enter",
-        "when": "editorLangId == r && editorHasSelection"
+        "when": "editorTextFocus && editorLangId == 'r'"
       },
       {
         "command": "rSendToJupyter.sendFile",
         "key": "ctrl+shift+enter",
-        "when": "editorLangId == r"
-      },
-      {
-        "command": "rSendToJupyter.sendToRmd",
-        "key": "alt+enter",
-        "when": "editorLangId == r && editorHasSelection"
-      },
-      {
-        "command": "rSendToJupyter.sendFileToRmd",
-        "key": "alt+shift+enter",
-        "when": "editorLangId == r"
+        "when": "editorTextFocus && editorLangId == 'r'"
       }
     ],
     "menus": {
