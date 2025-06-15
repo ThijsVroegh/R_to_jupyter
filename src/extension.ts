@@ -52,17 +52,28 @@ async function sendToJupyter(mode: 'selection' | 'file') {
             const selection = editor.selection;
             
             if (selection.isEmpty) {
-                // No text selected, just use the current line
+                // No text selected, try to detect code block
                 const lineNumber = selection.active.line;
                 const currentLine = editor.document.lineAt(lineNumber);
                 
-                // Select the whole line for visual feedback
-                editor.selection = new vscode.Selection(
-                    currentLine.range.start,
-                    currentLine.range.end
-                );
+                // Check if this line is part of a code block
+                const blockRange = detectCodeBlock(editor.document, lineNumber);
                 
-                codeToSend = currentLine.text;
+                if (blockRange && blockRange.start.line !== blockRange.end.line) {
+                    // We found a multi-line code block
+                    editor.selection = new vscode.Selection(
+                        blockRange.start,
+                        blockRange.end
+                    );
+                    codeToSend = editor.document.getText(blockRange);
+                } else {
+                    // Just use the current line
+                    editor.selection = new vscode.Selection(
+                        currentLine.range.start,
+                        currentLine.range.end
+                    );
+                    codeToSend = currentLine.text;
+                }
             } else {
                 // Text is selected, use the selection
                 codeToSend = editor.document.getText(selection);
@@ -468,129 +479,130 @@ async function sendToJupyter(mode: 'selection' | 'file') {
 }
 
 /**
- * Find the start line of a code block
+ * Detects a code block in R code
  * @param document The text document
- * @param currentLine The line to start from
- * @returns The line number where the block starts
+ * @param currentLine The line to check
+ * @returns A range covering the entire code block
  */
-function findStartOfBlock(document: vscode.TextDocument, currentLine: number): number {
+function detectCodeBlock(document: vscode.TextDocument, currentLine: number): vscode.Range {
+    // Get the current line text
+    const currentLineText = document.lineAt(currentLine).text;
+    
+    // Check if this line has pipe indicators
+    const hasPipe = currentLineText.includes('%>%') || 
+                    currentLineText.includes('|>') || 
+                    currentLineText.includes('+');
+                    
+    const isPipeContinuation = currentLineText.trim().startsWith('%>%') || 
+                               currentLineText.trim().startsWith('|>') || 
+                               currentLineText.trim().startsWith('+');
+                               
+    // Check if we're in a pipe chain
+    const isInPipeChain = hasPipe || isPipeContinuation || 
+                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('%>%')) ||
+                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('|>')) ||
+                          (currentLine > 0 && document.lineAt(currentLine-1).text.trim().endsWith('+'));
+    
+    // If not in a pipe chain, just return the current line
+    if (!isInPipeChain) {
+        return document.lineAt(currentLine).range;
+    }
+    
+    // We're in a pipe chain, find its boundaries
     let startLine = currentLine;
-    let openBraces = 0;
-    let openParens = 0;
-    let inPipe = false;
+    let endLine = currentLine;
     
-    // Check the current line first
-    const currentText = document.lineAt(currentLine).text;
-    openBraces += (currentText.match(/{/g) || []).length;
-    openBraces -= (currentText.match(/}/g) || []).length;
-    openParens += (currentText.match(/\(/g) || []).length;
-    openParens -= (currentText.match(/\)/g) || []).length;
-    inPipe = currentText.includes('%>%') || currentText.includes('|>') || 
-             currentText.includes('+') && currentText.trim().startsWith('+');
-    
-    // Go up until we find the start of the block
+    // Find the start by going backward
     for (let i = currentLine - 1; i >= 0; i--) {
-        const line = document.lineAt(i).text.trim();
+        const lineText = document.lineAt(i).text.trim();
         
         // Skip empty lines and comments
-        if (line === '' || line.startsWith('#')) {
+        if (lineText === '' || lineText.startsWith('#')) {
             continue;
         }
         
-        // Check for block structures
-        openBraces += (line.match(/{/g) || []).length;
-        openBraces -= (line.match(/}/g) || []).length;
-        openParens += (line.match(/\(/g) || []).length;
-        openParens -= (line.match(/\)/g) || []).length;
+        // If this line ends with a pipe operator
+        if (lineText.endsWith('%>%') || lineText.endsWith('|>') || lineText.endsWith('+')) {
+            startLine = i;
+            continue;
+        }
         
-        // Check for pipes and ggplot continuation
-        const hasPipe = line.includes('%>%') || line.includes('|>');
-        const isGgplotContinuation = line.includes('+') && !line.trim().startsWith('+');
-        
-        // If we're in a pipe chain, continue until we find a line that doesn't end with a pipe
-        if (inPipe) {
-            if (!hasPipe && !line.endsWith('+')) {
-                inPipe = false;
-                startLine = i;
-                break;
-            }
+        // We've reached a line that doesn't end with a pipe operator
+        // Check if it might be the start of the pipe chain
+        if (lineText.includes('<-') || lineText.includes('=')) {
             startLine = i;
+        } else {
+            startLine = i + 1;
         }
-        // If we find a line with a pipe at the end, we're starting a pipe chain
-        else if (hasPipe || isGgplotContinuation) {
-            inPipe = true;
-            startLine = i;
-        }
-        // If we've found balanced braces and parentheses, and we're not in a pipe chain
-        else if (openBraces <= 0 && openParens <= 0 && !inPipe) {
-            startLine = i;
-            break;
-        }
+        break;
     }
     
-    return startLine;
+    // Find the end by going forward
+    for (let i = currentLine + 1; i < document.lineCount; i++) {
+        const lineText = document.lineAt(i).text.trim();
+        
+        // Skip empty lines and comments
+        if (lineText === '' || lineText.startsWith('#')) {
+            continue;
+        }
+        
+        // If this line starts with a pipe continuation
+        if (lineText.startsWith('%>%') || lineText.startsWith('|>') || lineText.startsWith('+')) {
+            endLine = i;
+            continue;
+        }
+        
+        // We've reached a line that doesn't continue the pipe
+        break;
+    }
+    
+    return new vscode.Range(
+        new vscode.Position(startLine, 0),
+        document.lineAt(endLine).range.end
+    );
 }
 
 /**
- * Find the end line of a code block
- * @param document The text document
- * @param currentLine The line to start from
- * @returns The line number where the block ends
+ * Helper function to detect ggplot expressions specifically
  */
-function findEndOfBlock(document: vscode.TextDocument, currentLine: number): number {
-    let endLine = currentLine;
-    let openBraces = 0;
-    let openParens = 0;
-    let inPipe = false;
+function isPartOfGgplotExpression(document: vscode.TextDocument, lineNumber: number): boolean {
+    const lineText = document.lineAt(lineNumber).text;
     
-    // Check the current line first
-    const currentText = document.lineAt(currentLine).text;
-    openBraces += (currentText.match(/{/g) || []).length;
-    openBraces -= (currentText.match(/}/g) || []).length;
-    openParens += (currentText.match(/\(/g) || []).length;
-    openParens -= (currentText.match(/\)/g) || []).length;
-    inPipe = currentText.includes('%>%') || currentText.includes('|>') || 
-             currentText.trim().endsWith('+');
+    // Check if this line contains ggplot code
+    if (lineText.includes('ggplot(') || 
+        lineText.trim().startsWith('geom_') ||
+        lineText.trim().startsWith('scale_') ||
+        lineText.trim().startsWith('theme_') ||
+        lineText.trim().startsWith('labs(') ||
+        lineText.trim().startsWith('coord_') ||
+        lineText.trim().startsWith('facet_') ||
+        lineText.trim().startsWith('+')) {
+        return true;
+    }
     
-    // Go down until we find the end of the block
-    for (let i = currentLine + 1; i < document.lineCount; i++) {
-        const line = document.lineAt(i).text.trim();
-        
-        // Skip empty lines and comments
-        if (line === '' || line.startsWith('#')) {
+    // Check if this line is part of a ggplot continuation
+    for (let i = lineNumber - 1; i >= 0; i--) {
+        const previousLine = document.lineAt(i).text.trim();
+        if (previousLine === '' || previousLine.startsWith('#')) {
             continue;
         }
         
-        // Check for block structures
-        openBraces += (line.match(/{/g) || []).length;
-        openBraces -= (line.match(/}/g) || []).length;
-        openParens += (line.match(/\(/g) || []).length;
-        openParens -= (line.match(/\)/g) || []).length;
+        if (previousLine.endsWith('+') || 
+            previousLine.includes('ggplot(') ||
+            previousLine.trim().startsWith('geom_') ||
+            previousLine.trim().startsWith('scale_') ||
+            previousLine.trim().startsWith('theme_') ||
+            previousLine.trim().startsWith('labs(') ||
+            previousLine.trim().startsWith('coord_') ||
+            previousLine.trim().startsWith('facet_')) {
+            return true;
+        }
         
-        // Check for pipes and ggplot continuation
-        const startsWithPlus = line.trim().startsWith('+');
-        const hasPipe = line.includes('%>%') || line.includes('|>');
-        
-        // If we're in a pipe chain, continue until we find a line that doesn't have a pipe
-        if (inPipe) {
-            if (!hasPipe && !startsWithPlus) {
-                inPipe = false;
-            }
-            endLine = i;
-        }
-        // If we find a line with a pipe or starting with +, we're continuing a chain
-        else if (hasPipe || startsWithPlus) {
-            inPipe = true;
-            endLine = i;
-        }
-        // If we've found balanced braces and parentheses, and we're not in a pipe chain
-        else if (openBraces <= 0 && openParens <= 0 && !inPipe) {
-            endLine = i;
-            break;
-        }
+        // If we hit a line that doesn't end with + and isn't ggplot related, stop
+        break;
     }
     
-    return endLine;
+    return false;
 }
 
 export function deactivate() {}
