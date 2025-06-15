@@ -1,6 +1,7 @@
 print("Loading libraries...")
 
 library(tidyverse)
+library(dplyr)
 
 rm(list = ls())
 

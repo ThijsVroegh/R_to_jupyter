@@ -554,61 +554,158 @@ function detectPipeOrBlockRange(document: vscode.TextDocument, currentLine: numb
                line.includes('facet_');
     };
     
-    // Get the current line text and adjacent lines
-    const currentLineText = document.lineAt(currentLine).text;
-    const prevLine = currentLine > 0 ? document.lineAt(currentLine - 1).text : '';
-    const nextLine = currentLine < document.lineCount - 1 ? document.lineAt(currentLine + 1).text : '';
+    // First, check if we need more advanced detection by examining the entire document
+    // This is especially important for mixed pipe chains
+    let entireChainFound = false;
+    let chainStartLine = currentLine;
+    let chainEndLine = currentLine;
     
-    // Check if we're in a pipe or ggplot chain
-    const isInDplyrPipe = hasDplyrPipe(currentLineText) || 
-                           endsDplyrPipe(prevLine) ||
-                           startsDplyrPipe(currentLineText) ||
-                           startsDplyrPipe(nextLine);
-                           
-   
-    const isInGgplot = isGgplotRelated(currentLineText) ||
-                       hasPlus(currentLineText) ||
-                       endsPlus(prevLine) ||
-                       startsPlus(currentLineText) ||
-                       startsPlus(nextLine);
-    
-    // If not in any chain, just return the current line
-    if (!isInDplyrPipe && !isInGgplot) {
-        return document.lineAt(currentLine).range;
+    // First scan: quick check of the entire document for pipe chain patterns
+    // This helps with cases where cursor is in the middle or end of a complex chain
+    if (document.lineCount <= 300) { // Only do full scan for reasonably sized files
+        let inChain = false;
+        let candidateStart = -1;
+        
+        for (let i = 0; i < document.lineCount; i++) {
+            const lineText = document.lineAt(i).text.trim();
+            
+            // Skip empty lines and comments
+            if (lineText === '' || lineText.startsWith('#')) {
+                continue;
+            }
+            
+            // Check if this could be a start of a chain
+            const couldBeStart = !startsDplyrPipe(lineText) && !startsPlus(lineText);
+            
+            // Check if this is part of a chain
+            const isChainPart = hasDplyrPipe(lineText) || 
+                              isGgplotRelated(lineText) || 
+                              hasPlus(lineText) ||
+                              startsDplyrPipe(lineText) ||
+                              startsPlus(lineText);
+                              
+            // Check if this is a chain end
+            const isChainEnd = !endsDplyrPipe(lineText) && !endsPlus(lineText);
+            
+            // Start of a potential chain
+            if (!inChain && isChainPart && couldBeStart) {
+                inChain = true;
+                candidateStart = i;
+            }
+            
+            // Inside a chain
+            if (inChain) {
+                // Check if we have a chain that contains our target line
+                if (i >= currentLine && candidateStart <= currentLine) {
+                    // End of chain detected and it contains our cursor line
+                    if (isChainEnd && (i === document.lineCount - 1 || 
+                        (!startsDplyrPipe(document.lineAt(i+1).text) && !startsPlus(document.lineAt(i+1).text)))) {
+                        entireChainFound = true;
+                        chainStartLine = candidateStart;
+                        chainEndLine = i;
+                        break;
+                    }
+                }
+                
+                // End of current chain
+                if (isChainEnd && (i === document.lineCount - 1 || 
+                    (!startsDplyrPipe(document.lineAt(i+1).text) && !startsPlus(document.lineAt(i+1).text)))) {
+                    inChain = false;
+                    candidateStart = -1;
+                }
+            }
+        }
     }
+    
+    // If we already found a full chain containing our line, use that
+    if (entireChainFound) {
+        return new vscode.Range(
+            new vscode.Position(chainStartLine, 0),
+            document.lineAt(chainEndLine).range.end
+        );
+    }
+    
+    // Otherwise, use our detailed detection logic as before
+    
+    // Get the current line and surrounding context
+    const currentLineText = document.lineAt(currentLine).text;
+    const lookAround = 5; // Look more lines in each direction for better context
+    
+    // Check a range of surrounding lines for clues
+    let hasGgplotContext = false;
+    let hasPipeContext = false;
+    
+    for (let i = Math.max(0, currentLine - lookAround); 
+         i <= Math.min(document.lineCount - 1, currentLine + lookAround); i++) {
+        
+        const lineText = document.lineAt(i).text.trim();
+        
+        // Skip empty lines and comments
+        if (lineText === '' || lineText.startsWith('#')) {
+            continue;
+        }
+        
+        // Check for ggplot context
+        if (isGgplotRelated(lineText) || hasPlus(lineText)) {
+            hasGgplotContext = true;
+        }
+        
+        // Check for pipe context
+        if (hasDplyrPipe(lineText)) {
+            hasPipeContext = true;
+        }
+    }
+    
+    // Special handling for mixed pipe and ggplot chains
+    const isMixedChain = hasGgplotContext && hasPipeContext;
     
     // --- Find the start of the code block ---
     let startLine = currentLine;
     
     // Look backward to find the start of the chain
     for (let i = currentLine; i >= 0; i--) {
-        const line = document.lineAt(i).text.trim();
+        const lineText = document.lineAt(i).text.trim();
         
         // Skip empty lines and comments
-        if (line === '' || line.startsWith('#')) {
+        if (lineText === '' || lineText.startsWith('#')) {
             continue;
         }
         
-        // Check for data source or assignment that could be the start
-        if ((line.includes('<-') || line.includes('=')) && 
-            !endsDplyrPipe(line) && !endsPlus(line)) {
+        // For mixed chains or pure pipes, look for data source or pipe start
+        if ((isMixedChain || hasPipeContext) && 
+            !lineText.startsWith('%>%') && !lineText.startsWith('|>') &&
+            (i === 0 || !document.lineAt(i-1).text.trim().endsWith('%>%') && 
+             !document.lineAt(i-1).text.trim().endsWith('|>'))) {
             startLine = i;
             break;
         }
         
-        // Check for data frame references that could be the start
-        if (i > 0) {
-            const prevToLine = document.lineAt(i-1).text.trim();
-            // If current line doesn't continue and previous doesn't end with continuation
-            if (!startsDplyrPipe(line) && !startsPlus(line) &&
-                !endsDplyrPipe(prevToLine) && !endsPlus(prevToLine)) {
-                // This could be a start (data reference, etc.)
-                startLine = i;
+        // For ggplot chains, look for the ggplot call
+        if (hasGgplotContext && !hasPipeContext && lineText.includes('ggplot(')) {
+            startLine = i;
+            
+            // Check for assignment
+            if (lineText.includes('<-') || lineText.includes('=')) {
                 break;
             }
+            
+            // Check previous lines for assignment
+            for (let j = i - 1; j >= 0; j--) {
+                const assignLineText = document.lineAt(j).text.trim();
+                
+                if (assignLineText === '' || assignLineText.startsWith('#')) {
+                    continue;
+                }
+                
+                if (assignLineText.includes('<-') || assignLineText.includes('=')) {
+                    startLine = j;
+                }
+                break;
+            }
+            break;
         }
         
-        // Keep tracking back
+        // Keep updating the startLine as we go
         startLine = i;
     }
     
@@ -616,23 +713,26 @@ function detectPipeOrBlockRange(document: vscode.TextDocument, currentLine: numb
     let endLine = currentLine;
     
     // Look forward to find the end of the chain
-    for (let i = currentLine; i < document.lineCount; i++) {
-        const line = document.lineAt(i).text.trim();
+    for (let i = Math.max(currentLine, startLine); i < document.lineCount; i++) {
+        const lineText = document.lineAt(i).text.trim();
         
         // Skip empty lines and comments
-        if (line === '' || line.startsWith('#')) {
+        if (lineText === '' || lineText.startsWith('#')) {
             continue;
         }
         
-        // Update the current end line as we go
+        // Keep tracking the end line
         endLine = i;
         
-        // If this line doesn't end with pipe/plus and next line doesn't continue
-        if (!endsDplyrPipe(line) && !endsPlus(line) && 
-            (i === document.lineCount - 1 || 
-             (!startsDplyrPipe(document.lineAt(i+1).text) && 
-              !startsPlus(document.lineAt(i+1).text)))) {
-            break;
+        // If this is potentially the end of the chain
+        if (!lineText.endsWith('%>%') && !lineText.endsWith('|>') && !lineText.endsWith('+')) {
+            // Check if the next line continues the chain
+            if (i === document.lineCount - 1 || 
+                (!document.lineAt(i+1).text.trim().startsWith('%>%') && 
+                 !document.lineAt(i+1).text.trim().startsWith('|>') && 
+                 !document.lineAt(i+1).text.trim().startsWith('+'))) {
+                break;
+            }
         }
     }
     
